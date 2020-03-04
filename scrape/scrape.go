@@ -47,6 +47,8 @@ import (
 	"github.com/prometheus/prometheus/storage"
 )
 
+var errNameLabelMandatory = fmt.Errorf("missing metric name (%s label)", labels.MetricName)
+
 var (
 	targetIntervalLength = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
@@ -1154,6 +1156,11 @@ loop:
 				continue
 			}
 
+			if !lset.Has(labels.MetricName) {
+				err = errNameLabelMandatory
+				break loop
+			}
+
 			var ref uint64
 			ref, err = app.Add(lset, t, v)
 			switch err {
@@ -1365,7 +1372,7 @@ func zeroConfig(c *config.ScrapeConfig) *config.ScrapeConfig {
 	return &z
 }
 
-// reusableCache compares two scrape config and tells wheter the cache is still
+// reusableCache compares two scrape config and tells whether the cache is still
 // valid.
 func reusableCache(r, l *config.ScrapeConfig) bool {
 	if r == nil || l == nil {
