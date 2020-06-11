@@ -565,6 +565,32 @@ var testExpr = []struct {
 			VectorMatching: &VectorMatching{Card: CardOneToOne},
 		},
 	}, {
+		input: "foo * sum",
+		expected: &BinaryExpr{
+			Op: MUL,
+			LHS: &VectorSelector{
+				Name: "foo",
+				LabelMatchers: []*labels.Matcher{
+					mustLabelMatcher(labels.MatchEqual, string(model.MetricNameLabel), "foo"),
+				},
+				PosRange: PositionRange{
+					Start: 0,
+					End:   3,
+				},
+			},
+			RHS: &VectorSelector{
+				Name: "sum",
+				LabelMatchers: []*labels.Matcher{
+					mustLabelMatcher(labels.MatchEqual, string(model.MetricNameLabel), "sum"),
+				},
+				PosRange: PositionRange{
+					Start: 6,
+					End:   9,
+				},
+			},
+			VectorMatching: &VectorMatching{Card: CardOneToOne},
+		},
+	}, {
 		input: "foo == 1",
 		expected: &BinaryExpr{
 			Op: EQL,
@@ -1312,6 +1338,19 @@ var testExpr = []struct {
 			},
 		},
 	}, {
+		input: "min",
+		expected: &VectorSelector{
+			Name:   "min",
+			Offset: 0,
+			LabelMatchers: []*labels.Matcher{
+				mustLabelMatcher(labels.MatchEqual, string(model.MetricNameLabel), "min"),
+			},
+			PosRange: PositionRange{
+				Start: 0,
+				End:   3,
+			},
+		},
+	}, {
 		input: "foo offset 5m",
 		expected: &VectorSelector{
 			Name:   "foo",
@@ -1930,7 +1969,7 @@ var testExpr = []struct {
 	}, {
 		input:  `sum some_metric by (test)`,
 		fail:   true,
-		errMsg: "unexpected identifier \"some_metric\" in aggregation",
+		errMsg: "unexpected identifier \"some_metric\"",
 	}, {
 		input:  `sum (some_metric) by test`,
 		fail:   true,
@@ -1946,7 +1985,7 @@ var testExpr = []struct {
 	}, {
 		input:  "MIN keep_common (some_metric)",
 		fail:   true,
-		errMsg: "1:5: parse error: unexpected identifier \"keep_common\" in aggregation",
+		errMsg: "1:5: parse error: unexpected identifier \"keep_common\"",
 	}, {
 		input:  "MIN (some_metric) keep_common",
 		fail:   true,
@@ -2092,9 +2131,21 @@ var testExpr = []struct {
 		fail:   true,
 		errMsg: "expected 1 argument(s) in call to \"floor\", got 2",
 	}, {
+		input:  "floor(some_metric, 1)",
+		fail:   true,
+		errMsg: "expected 1 argument(s) in call to \"floor\", got 2",
+	}, {
 		input:  "floor(1)",
 		fail:   true,
 		errMsg: "expected type instant vector in call to function \"floor\", got scalar",
+	}, {
+		input:  "hour(some_metric, some_metric, some_metric)",
+		fail:   true,
+		errMsg: "expected at most 1 argument(s) in call to \"hour\", got 3",
+	}, {
+		input:  "time(some_metric)",
+		fail:   true,
+		errMsg: "expected 0 argument(s) in call to \"time\", got 1",
 	}, {
 		input:  "non_existent_function_far_bar()",
 		fail:   true,
@@ -2125,6 +2176,55 @@ var testExpr = []struct {
 		input:  "a>b()",
 		fail:   true,
 		errMsg: `unknown function`,
+	}, {
+		input:  "rate(avg)",
+		fail:   true,
+		errMsg: `expected type range vector`,
+	}, {
+		input: "sum(sum)",
+		expected: &AggregateExpr{
+			Op: SUM,
+			Expr: &VectorSelector{
+				Name: "sum",
+				LabelMatchers: []*labels.Matcher{
+					mustLabelMatcher(labels.MatchEqual, string(model.MetricNameLabel), "sum"),
+				},
+				PosRange: PositionRange{
+					Start: 4,
+					End:   7,
+				},
+			},
+			PosRange: PositionRange{
+				Start: 0,
+				End:   8,
+			},
+		},
+	}, {
+		input: "a + sum",
+		expected: &BinaryExpr{
+			Op: ADD,
+			LHS: &VectorSelector{
+				Name: "a",
+				LabelMatchers: []*labels.Matcher{
+					mustLabelMatcher(labels.MatchEqual, string(model.MetricNameLabel), "a"),
+				},
+				PosRange: PositionRange{
+					Start: 0,
+					End:   1,
+				},
+			},
+			RHS: &VectorSelector{
+				Name: "sum",
+				LabelMatchers: []*labels.Matcher{
+					mustLabelMatcher(labels.MatchEqual, string(model.MetricNameLabel), "sum"),
+				},
+				PosRange: PositionRange{
+					Start: 4,
+					End:   7,
+				},
+			},
+			VectorMatching: &VectorMatching{},
+		},
 	},
 	// String quoting and escape sequence interpretation tests.
 	{
@@ -2492,6 +2592,16 @@ func TestParseExpressions(t *testing.T) {
 		} else {
 			testutil.NotOk(t, err)
 			testutil.Assert(t, strings.Contains(err.Error(), test.errMsg), "unexpected error on input '%s', expected '%s', got '%s'", test.input, test.errMsg, err.Error())
+
+			errorList, ok := err.(ParseErrors)
+
+			testutil.Assert(t, ok, "unexpected error type")
+
+			for _, e := range errorList {
+				testutil.Assert(t, 0 <= e.PositionRange.Start, "parse error has negative position\nExpression '%s'\nError: %v", test.input, e)
+				testutil.Assert(t, e.PositionRange.Start <= e.PositionRange.End, "parse error has negative length\nExpression '%s'\nError: %v", test.input, e)
+				testutil.Assert(t, e.PositionRange.End <= Pos(len(test.input)), "parse error is not contained in input\nExpression '%s'\nError: %v", test.input, e)
+			}
 		}
 	}
 }

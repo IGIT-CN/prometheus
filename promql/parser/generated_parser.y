@@ -199,7 +199,10 @@ aggregate_expr  : aggregate_op aggregate_modifier function_call_body
                 | aggregate_op function_call_body
                         { $$ = yylex.(*parser).newAggregateExpr($1, &AggregateExpr{}, $2) }
                 | aggregate_op error
-                        { yylex.(*parser).unexpected("aggregation",""); $$ = nil }
+                        { 
+                        yylex.(*parser).unexpected("aggregation",""); 
+                        $$ = yylex.(*parser).newAggregateExpr($1, &AggregateExpr{}, Expressions{})
+                        }
                 ;
 
 aggregate_modifier:
@@ -532,7 +535,7 @@ metric          : metric_identifier label_set
                 ;
 
 
-metric_identifier: METRIC_IDENTIFIER | IDENTIFIER;
+metric_identifier: AVG | BOTTOMK | BY | COUNT | COUNT_VALUES |  IDENTIFIER |  LAND | LOR | LUNLESS | MAX | METRIC_IDENTIFIER | MIN | OFFSET | QUANTILE | STDDEV | STDVAR | SUM | TOPK;
 
 label_set       : LEFT_BRACE label_set_list RIGHT_BRACE
                         { $$ = labels.New($2...) }

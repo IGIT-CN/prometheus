@@ -64,7 +64,7 @@ func (q *querier) LabelNames() ([]string, storage.Warnings, error) {
 
 func (q *querier) lvals(qs []storage.Querier, n string) ([]string, storage.Warnings, error) {
 	if len(qs) == 0 {
-		return nil, nil, nil
+		return []string{}, nil, nil
 	}
 	if len(qs) == 1 {
 		return qs[0].LabelValues(n)
@@ -75,41 +75,33 @@ func (q *querier) lvals(qs []storage.Querier, n string) ([]string, storage.Warni
 	s1, w, err := q.lvals(qs[:l], n)
 	ws = append(ws, w...)
 	if err != nil {
-		return nil, ws, err
+		return []string{}, ws, err
 	}
 	s2, ws, err := q.lvals(qs[l:], n)
 	ws = append(ws, w...)
 	if err != nil {
-		return nil, ws, err
+		return []string{}, ws, err
 	}
 	return mergeStrings(s1, s2), ws, nil
 }
 
-func (q *querier) Select(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	if len(q.blocks) != 1 {
-		return q.SelectSorted(p, ms...)
-	}
-	// Sorting Head series is slow, and unneeded when only the
-	// Head is being queried. Sorting blocks is a noop.
-	return q.blocks[0].Select(p, ms...)
-}
-
-func (q *querier) SelectSorted(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+func (q *querier) Select(sortSeries bool, hints *storage.SelectHints, ms ...*labels.Matcher) storage.SeriesSet {
 	if len(q.blocks) == 0 {
-		return storage.EmptySeriesSet(), nil, nil
+		return storage.EmptySeriesSet()
 	}
-	ss := make([]storage.SeriesSet, len(q.blocks))
-	var ws storage.Warnings
-	for i, b := range q.blocks {
-		s, w, err := b.SelectSorted(p, ms...)
-		ws = append(ws, w...)
-		if err != nil {
-			return nil, ws, err
-		}
-		ss[i] = s
+	if len(q.blocks) == 1 {
+		// Sorting Head series is slow, and unneeded when only the
+		// Head is being queried.
+		return q.blocks[0].Select(sortSeries, hints, ms...)
 	}
 
-	return NewMergedSeriesSet(ss), ws, nil
+	ss := make([]storage.SeriesSet, len(q.blocks))
+	for i, b := range q.blocks {
+		// We have to sort if blocks > 1 as MergedSeriesSet requires it.
+		ss[i] = b.Select(true, hints, ms...)
+	}
+
+	return NewMergedSeriesSet(ss)
 }
 
 func (q *querier) Close() error {
@@ -127,40 +119,28 @@ type verticalQuerier struct {
 	querier
 }
 
-func (q *verticalQuerier) Select(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	return q.sel(p, q.blocks, ms)
+func (q *verticalQuerier) Select(sortSeries bool, hints *storage.SelectHints, ms ...*labels.Matcher) storage.SeriesSet {
+	return q.sel(sortSeries, hints, q.blocks, ms)
 }
 
-func (q *verticalQuerier) SelectSorted(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	return q.sel(p, q.blocks, ms)
-}
-
-func (q *verticalQuerier) sel(p *storage.SelectParams, qs []storage.Querier, ms []*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+func (q *verticalQuerier) sel(sortSeries bool, hints *storage.SelectHints, qs []storage.Querier, ms []*labels.Matcher) storage.SeriesSet {
 	if len(qs) == 0 {
-		return storage.EmptySeriesSet(), nil, nil
+		return storage.EmptySeriesSet()
 	}
 	if len(qs) == 1 {
-		return qs[0].SelectSorted(p, ms...)
+		return qs[0].Select(sortSeries, hints, ms...)
 	}
 	l := len(qs) / 2
 
-	var ws storage.Warnings
-	a, w, err := q.sel(p, qs[:l], ms)
-	ws = append(ws, w...)
-	if err != nil {
-		return nil, ws, err
-	}
-	b, w, err := q.sel(p, qs[l:], ms)
-	ws = append(ws, w...)
-	if err != nil {
-		return nil, ws, err
-	}
-	return newMergedVerticalSeriesSet(a, b), ws, nil
+	return newMergedVerticalSeriesSet(
+		q.sel(sortSeries, hints, qs[:l], ms),
+		q.sel(sortSeries, hints, qs[l:], ms),
+	)
 }
 
 // NewBlockQuerier returns a querier against the reader.
 func NewBlockQuerier(b BlockReader, mint, maxt int64) (storage.Querier, error) {
-	indexr, err := b.Index(mint, maxt)
+	indexr, err := b.Index()
 	if err != nil {
 		return nil, errors.Wrapf(err, "open index reader")
 	}
@@ -195,17 +175,24 @@ type blockQuerier struct {
 	mint, maxt int64
 }
 
-func (q *blockQuerier) Select(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	base, err := LookupChunkSeries(q.index, q.tombstones, ms...)
+func (q *blockQuerier) Select(sortSeries bool, hints *storage.SelectHints, ms ...*labels.Matcher) storage.SeriesSet {
+	var base storage.DeprecatedChunkSeriesSet
+	var err error
+
+	if sortSeries {
+		base, err = LookupChunkSeriesSorted(q.index, q.tombstones, ms...)
+	} else {
+		base, err = LookupChunkSeries(q.index, q.tombstones, ms...)
+	}
 	if err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 
 	mint := q.mint
 	maxt := q.maxt
-	if p != nil {
-		mint = p.Start
-		maxt = p.End
+	if hints != nil {
+		mint = hints.Start
+		maxt = hints.End
 	}
 	return &blockSeriesSet{
 		set: &populatedChunkSeries{
@@ -217,32 +204,7 @@ func (q *blockQuerier) Select(p *storage.SelectParams, ms ...*labels.Matcher) (s
 
 		mint: mint,
 		maxt: maxt,
-	}, nil, nil
-}
-
-func (q *blockQuerier) SelectSorted(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	base, err := LookupChunkSeriesSorted(q.index, q.tombstones, ms...)
-	if err != nil {
-		return nil, nil, err
 	}
-
-	mint := q.mint
-	maxt := q.maxt
-	if p != nil {
-		mint = p.Start
-		maxt = p.End
-	}
-	return &blockSeriesSet{
-		set: &populatedChunkSeries{
-			set:    base,
-			chunks: q.chunks,
-			mint:   mint,
-			maxt:   maxt,
-		},
-
-		mint: mint,
-		maxt: maxt,
-	}, nil, nil
 }
 
 func (q *blockQuerier) LabelValues(name string) ([]string, storage.Warnings, error) {
@@ -525,6 +487,14 @@ func (s *mergedSeriesSet) Err() error {
 	return s.err
 }
 
+func (s *mergedSeriesSet) Warnings() storage.Warnings {
+	var ws storage.Warnings
+	for _, ss := range s.all {
+		ws = append(ws, ss.Warnings()...)
+	}
+	return ws
+}
+
 // nextAll is to call Next() for all SeriesSet.
 // Because the order of the SeriesSet slice will affect the results,
 // we need to use an buffer slice to hold the order.
@@ -533,7 +503,10 @@ func (s *mergedSeriesSet) nextAll() {
 	for _, ss := range s.all {
 		if ss.Next() {
 			s.buf = append(s.buf, ss)
-		} else if ss.Err() != nil {
+			continue
+		}
+
+		if ss.Err() != nil {
 			s.done = true
 			s.err = ss.Err()
 			break
@@ -647,6 +620,13 @@ func (s *mergedVerticalSeriesSet) Err() error {
 	return s.b.Err()
 }
 
+func (s *mergedVerticalSeriesSet) Warnings() storage.Warnings {
+	var ws storage.Warnings
+	ws = append(ws, s.a.Warnings()...)
+	ws = append(ws, s.b.Warnings()...)
+	return ws
+}
+
 func (s *mergedVerticalSeriesSet) compare() int {
 	if s.adone {
 		return 1
@@ -694,17 +674,17 @@ type baseChunkSeries struct {
 
 // LookupChunkSeries retrieves all series for the given matchers and returns a ChunkSeriesSet
 // over them. It drops chunks based on tombstones in the given reader.
-func LookupChunkSeries(ir IndexReader, tr tombstones.Reader, ms ...*labels.Matcher) (storage.ChunkSeriesSet, error) {
+func LookupChunkSeries(ir IndexReader, tr tombstones.Reader, ms ...*labels.Matcher) (storage.DeprecatedChunkSeriesSet, error) {
 	return lookupChunkSeries(false, ir, tr, ms...)
 }
 
 // LookupChunkSeries retrieves all series for the given matchers and returns a ChunkSeriesSet
 // over them. It drops chunks based on tombstones in the given reader. Series will be in order.
-func LookupChunkSeriesSorted(ir IndexReader, tr tombstones.Reader, ms ...*labels.Matcher) (storage.ChunkSeriesSet, error) {
+func LookupChunkSeriesSorted(ir IndexReader, tr tombstones.Reader, ms ...*labels.Matcher) (storage.DeprecatedChunkSeriesSet, error) {
 	return lookupChunkSeries(true, ir, tr, ms...)
 }
 
-func lookupChunkSeries(sorted bool, ir IndexReader, tr tombstones.Reader, ms ...*labels.Matcher) (storage.ChunkSeriesSet, error) {
+func lookupChunkSeries(sorted bool, ir IndexReader, tr tombstones.Reader, ms ...*labels.Matcher) (storage.DeprecatedChunkSeriesSet, error) {
 	if tr == nil {
 		tr = tombstones.NewMemTombstones()
 	}
@@ -739,7 +719,7 @@ func (s *baseChunkSeries) Next() bool {
 		ref := s.p.At()
 		if err := s.index.Series(ref, &lset, &chkMetas); err != nil {
 			// Postings may be stale. Skip if no underlying series exists.
-			if errors.Cause(err) == ErrNotFound {
+			if errors.Cause(err) == storage.ErrNotFound {
 				continue
 			}
 			s.err = err
@@ -778,7 +758,7 @@ func (s *baseChunkSeries) Next() bool {
 // with known chunk references. It filters out chunks that do not fit the
 // given time range.
 type populatedChunkSeries struct {
-	set        storage.ChunkSeriesSet
+	set        storage.DeprecatedChunkSeriesSet
 	chunks     ChunkReader
 	mint, maxt int64
 
@@ -819,7 +799,7 @@ func (s *populatedChunkSeries) Next() bool {
 			c.Chunk, s.err = s.chunks.Chunk(c.Ref)
 			if s.err != nil {
 				// This means that the chunk has be garbage collected. Remove it from the list.
-				if s.err == ErrNotFound {
+				if s.err == storage.ErrNotFound {
 					s.err = nil
 					// Delete in-place.
 					s.chks = append(chks[:j], chks[j+1:]...)
@@ -846,7 +826,7 @@ func (s *populatedChunkSeries) Next() bool {
 
 // blockSeriesSet is a set of series from an inverted index query.
 type blockSeriesSet struct {
-	set storage.ChunkSeriesSet
+	set storage.DeprecatedChunkSeriesSet
 	err error
 	cur storage.Series
 
@@ -872,8 +852,9 @@ func (s *blockSeriesSet) Next() bool {
 	return false
 }
 
-func (s *blockSeriesSet) At() storage.Series { return s.cur }
-func (s *blockSeriesSet) Err() error         { return s.err }
+func (s *blockSeriesSet) At() storage.Series         { return s.cur }
+func (s *blockSeriesSet) Err() error                 { return s.err }
+func (s *blockSeriesSet) Warnings() storage.Warnings { return nil }
 
 // chunkSeries is a series that is backed by a sequence of chunks holding
 // time series data.
@@ -1183,7 +1164,28 @@ func (it *deletedIterator) Seek(t int64) bool {
 	if it.it.Err() != nil {
 		return false
 	}
-	return it.it.Seek(t)
+	if ok := it.it.Seek(t); !ok {
+		return false
+	}
+
+	// Now double check if the entry falls into a deleted interval.
+	ts, _ := it.At()
+	for _, itv := range it.intervals {
+		if ts < itv.Mint {
+			return true
+		}
+
+		if ts > itv.Maxt {
+			it.intervals = it.intervals[1:]
+			continue
+		}
+
+		// We're in the middle of an interval, we can now call Next().
+		return it.Next()
+	}
+
+	// The timestamp is greater than all the deleted intervals.
+	return true
 }
 
 func (it *deletedIterator) Next() bool {
